@@ -111,6 +111,59 @@ export function rangeSummary(state, todayIso, days = 7, offsetDays = 0) {
   return { scheduled, completed, rate: scheduled ? completed / scheduled : null };
 }
 
+export function getPlan(state, iso) {
+  const plan = state.plans?.[iso];
+  return {
+    intention: typeof plan?.intention === 'string' ? plan.intention : '',
+    routineIds: Array.isArray(plan?.routineIds) ? plan.routineIds : [],
+  };
+}
+
+export function getReflection(state, iso) {
+  const reflection = state.reflections?.[iso];
+  return reflection && typeof reflection === 'object' ? reflection : null;
+}
+
+export function focusSummary(state, iso) {
+  const sessions = (state.sessions || []).filter((s) => s && s.date === iso && Number.isFinite(s.minutes));
+  const minutes = sessions.reduce((sum, s) => sum + s.minutes, 0);
+  return { date: iso, minutes, count: sessions.length, sessions };
+}
+
+export function focusRangeSummary(state, todayIso, days = 7) {
+  const dates = new Set();
+  for (let i = 0; i < days; i++) dates.add(addDays(todayIso, -i));
+  const sessions = (state.sessions || []).filter((s) => s && dates.has(s.date) && Number.isFinite(s.minutes));
+  return {
+    sessions,
+    minutes: sessions.reduce((sum, s) => sum + s.minutes, 0),
+    count: sessions.length,
+  };
+}
+
+export function completionRate(state, routine, todayIso, days = 28) {
+  let scheduled = 0;
+  let done = 0;
+  for (let i = 0; i < days; i++) {
+    const iso = addDays(todayIso, -i);
+    if (!isScheduledOn(routine, iso)) continue;
+    const complete = isDone(state, routine.id, iso);
+    // An unfinished today should not lower the rate first thing in the morning.
+    if (iso === todayIso && !complete) continue;
+    scheduled++;
+    if (complete) done++;
+  }
+  return { scheduled, done, rate: scheduled ? done / scheduled : null };
+}
+
+export function formatMinutes(total) {
+  const minutes = Math.max(0, Math.round(Number(total) || 0));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours}h ${String(rest).padStart(2, '0')}m` : `${hours}h`;
+}
+
 export function totalCompletions(state) {
   const ids = new Set(activeRoutines(state).map((r) => r.id));
   let count = 0;
@@ -203,6 +256,27 @@ export function buildInsights(state, todayIso, now = new Date()) {
     });
   }
 
+  const plan = getPlan(state, todayIso);
+  const focus = focusSummary(state, todayIso);
+  const focusedRoutines = plan.routineIds
+    .map((id) => routines.find((r) => r.id === id))
+    .filter(Boolean);
+  if (plan.intention || focusedRoutines.length || focus.minutes) {
+    const bits = [];
+    if (plan.intention) bits.push(`Intention: “${plan.intention}”.`);
+    if (focusedRoutines.length) {
+      const done = focusedRoutines.filter((r) => isDone(state, r.id, todayIso)).length;
+      bits.push(`Focus routines ${done}/${focusedRoutines.length} done.`);
+    }
+    if (focus.minutes) bits.push(`${formatMinutes(focus.minutes)} of focus logged.`);
+    const focusDone = focusedRoutines.length > 0
+      && focusedRoutines.every((r) => isDone(state, r.id, todayIso));
+    insights.push({
+      tone: focusDone || focus.minutes >= 45 ? 'good' : 'info',
+      text: bits.join(' '),
+    });
+  }
+
   const neglected = routines
     .map((r) => ({ routine: r, gap: daysSinceLastDone(state, r, todayIso) }))
     .filter((x) => x.gap !== null && x.gap >= 3 && !isDone(state, x.routine.id, todayIso))
@@ -264,6 +338,8 @@ export function answerQuestion(state, todayIso, message, now = new Date()) {
   const text = String(message || '').toLowerCase().trim();
   const routines = activeRoutines(state);
   const stats = dayStats(state, todayIso);
+  const plan = getPlan(state, todayIso);
+  const focus = focusSummary(state, todayIso);
   const streakList = routines
     .map((r) => ({ routine: r, streak: currentStreak(state, r, todayIso) }))
     .sort((a, b) => b.streak - a.streak);
@@ -277,6 +353,17 @@ export function answerQuestion(state, todayIso, message, now = new Date()) {
     return left > 0
       ? `Good ${timeOfDay(now)}. ${left} ${plural(left, 'routine is', 'routines are')} left today. Ask me about today, this week, streaks or what to focus on.`
       : `Good ${timeOfDay(now)}. Today is fully checked off — nothing to chase. Ask me about the week or your streaks.`;
+  }
+
+  if (/(pomodoro|deep work|focus (time|minutes|sessions?|timer|this week|today|yesterday)|how (was|is) my focus)/.test(text)) {
+    const weekFocus = focusRangeSummary(state, todayIso, 7);
+    if (!weekFocus.minutes) {
+      return 'No focus sessions logged yet. Start the timer on the Today page — even 15 minutes counts, and it lands in tonight’s report.';
+    }
+    const todayPart = focus.minutes
+      ? `${formatMinutes(focus.minutes)} today across ${focus.count} ${plural(focus.count, 'session', 'sessions')}`
+      : 'nothing logged today yet';
+    return `Focus: ${todayPart}. Last 7 days: ${formatMinutes(weekFocus.minutes)} across ${weekFocus.count} ${plural(weekFocus.count, 'session', 'sessions')}.`;
   }
 
   if (/(streak|chain|consisten)/.test(text)) {
@@ -302,10 +389,31 @@ export function answerQuestion(state, todayIso, message, now = new Date()) {
       .filter((x) => x.rate !== null && x.rate < 1)
       .sort((a, b) => a.rate - b.rate)[0];
     if (weakest) out += ` Weakest link: ${weakest.routine.name} (${weakest.done}/${weakest.scheduled}).`;
+    const weekFocus = focusRangeSummary(state, todayIso, 7);
+    if (weekFocus.minutes) {
+      out += ` Focus time: ${formatMinutes(weekFocus.minutes)} across ${weekFocus.count} ${plural(weekFocus.count, 'session', 'sessions')}.`;
+    }
     return out;
   }
 
+  if (/(intention|intent|today's plan|today’s plan|plan for today)/.test(text)) {
+    return plan.intention
+      ? `Today’s intention: “${plan.intention}”. Keep the next action small enough to start.`
+      : 'No intention set yet. Add one line in the focus panel — a direction for the day, not another task.';
+  }
+
   if (/(focus|what should i|suggest|recommend|next|priorit|advice)/.test(text)) {
+    const focused = plan.routineIds.map((id) => routines.find((r) => r.id === id)).filter(Boolean);
+    const openFocus = focused.filter((r) => !isDone(state, r.id, todayIso));
+    if (openFocus.length) {
+      return `Today’s focus: ${openFocus.map((r) => r.name).join(', ')}. Start with ${openFocus[0].name}; the timer is on the right when you are ready.`;
+    }
+    if (focused.length) {
+      return `All ${focused.length} of today’s focus routines are done.${focus.minutes ? ` You also logged ${formatMinutes(focus.minutes)} of focus time.` : ''}`;
+    }
+    if (plan.intention) {
+      return `Today’s intention is “${plan.intention}”. Pick one routine from Today, star it, and let that be the next action.`;
+    }
     const undone = stats.scheduled.filter((r) => !isDone(state, r.id, todayIso));
     if (undone.length) {
       const withGap = undone.map((r) => ({ r, gap: daysSinceLastDone(state, r, todayIso) ?? 99 }))
@@ -334,13 +442,14 @@ export function answerQuestion(state, todayIso, message, now = new Date()) {
   }
 
   if (/(help|what can you|how do you|capab)/.test(text)) {
-    return 'I can report today’s progress, review the last seven days, explain your streaks, pick what to focus on, or reset after missed days. I work entirely from the data in this tracker.';
+    return 'I can report today’s progress, review the last seven days, explain your streaks, pick what to focus on, summarize focus time, or reset after missed days. I work entirely from the data in this tracker.';
   }
 
   if (/(today|progress|how.*(doing|going)|status|am i)/.test(text)) {
     if (!stats.total) return 'Nothing is scheduled today, so there is no target to hit.';
     const remaining = stats.scheduled.filter((r) => !isDone(state, r.id, todayIso)).map((r) => r.name);
-    return `${stats.completed} of ${stats.total} done (${pct(stats.rate)}).${remaining.length ? ` Left: ${remaining.slice(0, 3).join(', ')}${remaining.length > 3 ? '…' : ''}.` : ' Everything is checked off.'}`;
+    const focusPart = focus.minutes ? ` Focus time: ${formatMinutes(focus.minutes)}.` : '';
+    return `${stats.completed} of ${stats.total} done (${pct(stats.rate)}).${remaining.length ? ` Left: ${remaining.slice(0, 3).join(', ')}${remaining.length > 3 ? '…' : ''}.` : ' Everything is checked off.'}${focusPart}`;
   }
 
   const fallbackStats = stats.total
@@ -369,9 +478,40 @@ export function buildDailyReport(state, dateIso, now = new Date()) {
     }
   }
 
+  const plan = getPlan(state, dateIso);
+  if (plan.intention) lines.push('', `Intention: **${plan.intention}**`);
+  const focused = plan.routineIds
+    .map((id) => (state.routines || []).find((r) => r.id === id))
+    .filter(Boolean);
+  if (focused.length) {
+    lines.push('', '## Today’s focus', '');
+    for (const routine of focused) {
+      lines.push(`- [${isDone(state, routine.id, dateIso) ? 'x' : ' '}] ${routine.name}`);
+    }
+  }
+
+  const focus = focusSummary(state, dateIso);
+  if (focus.minutes) {
+    const names = [...new Set(focus.sessions
+      .map((session) => (state.routines || []).find((r) => r.id === session.routineId)?.name)
+      .filter(Boolean))];
+    const suffix = names.length ? ` — ${names.join(', ')}` : '';
+    lines.push('', `Focus time: **${formatMinutes(focus.minutes)}** across ${focus.count} ${plural(focus.count, 'session', 'sessions')}${suffix}`);
+  }
+
   const week = rangeSummary(state, dateIso, 7);
   if (week.scheduled) {
     lines.push('', `Rolling 7 days: ${week.completed}/${week.scheduled} (${pct(week.rate)})`);
+  }
+
+  const reflection = getReflection(state, dateIso);
+  if (reflection) {
+    lines.push('', '## Day close', '');
+    const bits = [];
+    if (reflection.energy) bits.push(`Energy: **${reflection.energy}**`);
+    if (reflection.rating) bits.push(`Rating: **${reflection.rating}/5**`);
+    if (bits.length) lines.push(bits.join(' · '));
+    if (reflection.note) lines.push('', `> ${reflection.note.split('\n').join('\n> ')}`);
   }
 
   lines.push('', '## Coach notes', '');
